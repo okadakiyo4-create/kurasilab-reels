@@ -1,0 +1,115 @@
+name: reels-post
+
+on:
+  schedule:
+    - cron: "30 0 * * *"   # 毎日 日本時間 9:30（noteの投稿後）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run = 動画を作るだけ（投稿しない） / publish = Instagramへ投稿"
+        type: choice
+        options:
+          - dry_run
+          - publish
+        default: dry_run
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: reels
+  cancel-in-progress: false
+
+env:
+  MODE: ${{ github.event.inputs.mode || 'publish' }}
+  NOTE_USER_URLNAME: kurashi_laborg
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.prep.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk
+          pip install requests pillow edge-tts gTTS
+
+      - name: Make the reel (script, proofread, video)
+        id: prep
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python reels_post.py prepare
+
+      - name: Save preview (download to check the video)
+        if: ${{ steps.prep.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-preview
+          path: |
+            site/
+            work/script.json
+            work/meta.json
+
+      - name: Save meta for the next job
+        if: ${{ steps.prep.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-meta
+          path: work/meta.json
+
+      - name: Pack the video for GitHub Pages
+        if: ${{ steps.prep.outputs.skip != 'true' && env.MODE == 'publish' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  post:
+    needs: make
+    if: ${{ needs.make.outputs.skip != 'true' && (github.event.inputs.mode || 'publish') == 'publish' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: reel-meta
+          path: work
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install requests
+
+      - name: Publish the video on GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Post to Instagram
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          PAGES_URL: ${{ steps.deployment.outputs.page_url }}
+        run: python reels_post.py publish
+
+      - name: Save posted list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posted.json
+          git diff --cached --quiet || git commit -m "reel posted"
+          git push
