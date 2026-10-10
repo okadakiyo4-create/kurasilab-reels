@@ -645,9 +645,54 @@ def ig_headers():
 def ig_error_text(r):
     try:
         e = r.json().get("error", {})
-        return "%s code=%s %s" % (r.status_code, e.get("code"), e.get("message", ""))
+        text = "%s code=%s %s" % (r.status_code, e.get("code"), e.get("message", ""))
+        code = e.get("code")
     except ValueError:
         return "%s %s" % (r.status_code, r.text[:200])
+    if code == 190:
+        text += "  [対処] トークンが無効か期限切れです。トークンを作り直して IG_ACCESS_TOKEN を更新してください"
+    elif code in (10, 200):
+        text += ("  [対処] トークンに投稿の権限がありません。アプリに instagram_business_content_publish "
+                 "を追加してから、トークンを作り直してください")
+    elif code == 100:
+        text += ("  [対処] IDが違うか、トークンに投稿の権限がない可能性があります。"
+                 "ログの 'token belongs to' の行と IG_USER_ID を確認してください")
+    return text
+
+
+def resolve_ig_account():
+    """トークンから、アカウントのユーザー名とIDを調べる。投稿には、このIDを使う。"""
+    r = requests.get(ig_url("/me"), headers=ig_headers(),
+                     params={"fields": "user_id,username,account_type"}, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError("トークンからアカウント情報を取得できません: " + ig_error_text(r))
+    d = r.json()
+    uid = str(d.get("user_id") or d.get("id") or "")
+    log("info: token belongs to @%s (account_type=%s)"
+        % (d.get("username"), d.get("account_type")))
+    if not uid:
+        raise RuntimeError("アカウントのIDを取得できませんでした: %s" % list(d.keys()))
+    if IG_USER_ID and uid != IG_USER_ID:
+        log("warn: IG_USER_ID differs from the id of this token. Using the token's id: %s" % uid)
+        log("warn: please set the Secret IG_USER_ID to: %s" % uid)
+    else:
+        log("info: IG_USER_ID matches the token's account")
+    return uid
+
+
+def check_publish_limit(uid):
+    """投稿の権限と残り枠の確認（失敗しても続行）。"""
+    try:
+        r = requests.get(ig_url("/%s/content_publishing_limit" % uid),
+                         headers=ig_headers(),
+                         params={"fields": "quota_usage,config"}, timeout=60)
+        if r.status_code == 200:
+            data = (r.json().get("data") or [{}])[0]
+            log("info: publishing quota usage=%s" % data.get("quota_usage"))
+        else:
+            log("warn: publishing limit check failed: " + ig_error_text(r)[:300])
+    except requests.RequestException as e:
+        log("info: publishing limit check error (%s)" % type(e).__name__)
 
 
 def refresh_token_best_effort():
@@ -683,17 +728,17 @@ def wait_public(url, timeout_sec=420):
     return False
 
 
-def create_container(video_url, caption):
+def create_container(uid, video_url, caption):
     payload = {"media_type": "REELS", "video_url": video_url,
                "caption": caption, "share_to_feed": True}
     if IG_AI_LABEL:
         payload["is_ai_generated"] = True
-    r = requests.post(ig_url("/%s/media" % IG_USER_ID), headers=ig_headers(),
+    r = requests.post(ig_url("/%s/media" % uid), headers=ig_headers(),
                       json=payload, timeout=90)
     if r.status_code != 200 and "is_ai_generated" in r.text and IG_AI_LABEL:
         log("warn: is_ai_generated rejected, retrying without it")
         payload.pop("is_ai_generated")
-        r = requests.post(ig_url("/%s/media" % IG_USER_ID), headers=ig_headers(),
+        r = requests.post(ig_url("/%s/media" % uid), headers=ig_headers(),
                           json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError("コンテナ作成に失敗: " + ig_error_text(r))
@@ -718,10 +763,10 @@ def wait_container(cid, tries=24, interval=30):
     raise RuntimeError("動画の処理が時間内に終わりませんでした")
 
 
-def publish_container(cid):
+def publish_container(uid, cid):
     last = ""
     for attempt in range(4):
-        r = requests.post(ig_url("/%s/media_publish" % IG_USER_ID),
+        r = requests.post(ig_url("/%s/media_publish" % uid),
                           headers=ig_headers(), json={"creation_id": cid},
                           timeout=90)
         if r.status_code == 200:
@@ -733,8 +778,8 @@ def publish_container(cid):
 
 
 def cmd_publish():
-    if not IG_USER_ID or not IG_TOKEN:
-        raise RuntimeError("IG_USER_ID / IG_ACCESS_TOKEN が設定されていません")
+    if not IG_TOKEN:
+        raise RuntimeError("IG_ACCESS_TOKEN が設定されていません")
     with open(os.path.join(WORK_DIR, "meta.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
     base = os.environ.get("PAGES_URL", "").strip()
@@ -745,10 +790,12 @@ def cmd_publish():
     if not wait_public(video_url):
         raise RuntimeError("動画が公開されませんでした。Pagesの設定を確認してください")
     refresh_token_best_effort()
-    cid = create_container(video_url, meta["caption"])
+    uid = resolve_ig_account()
+    check_publish_limit(uid)
+    cid = create_container(uid, video_url, meta["caption"])
     log("container: " + cid)
     wait_container(cid)
-    media_id = publish_container(cid)
+    media_id = publish_container(uid, cid)
     log("POSTED: instagram media id " + media_id)
 
     posted = load_posted()
