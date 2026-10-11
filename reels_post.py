@@ -37,8 +37,14 @@ IG_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "").strip()
 IG_API_VERSION = os.environ.get("IG_API_VERSION", "v25.0").strip()
 IG_AI_LABEL = os.environ.get("IG_AI_LABEL", "1").strip() != "0"
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "4"))
-TTS_VOICE = os.environ.get("TTS_VOICE", "ja-JP-NanamiNeural")
-TTS_RATE = os.environ.get("TTS_RATE", "+5%")
+TTS_VOICE = os.environ.get("TTS_VOICE", "ja-JP-NanamiNeural")   # edge-tts用（予備）
+TTS_RATE = os.environ.get("TTS_RATE", "+5%")                    # edge-tts用（予備）
+# Gemini TTS（メインの声）。声を変えたいときは、リポジトリの変数 GEMINI_TTS_VOICE を変える
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "").strip() or "Sulafat"
+GEMINI_TTS_STYLE = os.environ.get(
+    "GEMINI_TTS_STYLE",
+    "Say in a warm, calm and natural conversational tone, like a friendly "
+    "woman talking to a friend, at a relaxed pace with gentle intonation")
 
 W, H = 1080, 1920
 SITE_DIR = "site"
@@ -66,6 +72,14 @@ BAD_PATTERNS = [
 CTA_NARRATION = "続きは、プロフィールのリンクから、noteで読めます。"
 CTA_HEADING = "続きはnoteで"
 CAPTION_TAIL = "続きはプロフィールのリンクのnoteで読めます。"
+# キャプションの末尾に毎回入れるプロフィール紹介（ここを書き換えれば変わります）
+CAPTION_FOOTER = (
+    "―――――\n"
+    "暮らしラボ\n"
+    "暮らしをちょっと整えて、毎日を軽やかに。\n"
+    "収納術・愛用品・家事アイデアを、今日から試せる小さな工夫で発信しています。\n"
+    "フォローして、毎日の暮らしのヒントを受け取ってください。"
+)
 
 
 def log(msg):
@@ -284,6 +298,9 @@ def make_script(title, text):
         "効果を足さない。\n"
         "- 構成: hook(気になる問いかけか結論) → points(3〜4個の要点)。"
         "最後の「続きはnoteで」は別に追加するので書かない。\n"
+        "- narration は、友達に話しかけるような自然な話し言葉にする。"
+        "短い文にし、息継ぎの場所には読点（、）を入れる。"
+        "アルファベットや記号は避け、読み間違えにくい表記にする。\n"
         "- hook: heading は20文字以内、narration は40文字以内。\n"
         "- 各point: heading は18文字以内、narration は45文字以内。"
         "話し言葉で短く。\n"
@@ -493,13 +510,99 @@ def render_slide(heading, body, kicker, idx, total, seed, out_path):
 
 
 # ----------------------------------------------------------------- audio
+_tts_state = {"models": None, "dead": set()}
+
+
+def tts_models(key):
+    """Gemini APIから、使える音声(TTS)モデルを探す（新しい順）。"""
+    if _tts_state["models"] is not None:
+        return _tts_state["models"]
+    names = []
+    try:
+        r = requests.get(GEMINI_BASE + "/models", params={"pageSize": 200},
+                         headers={"x-goog-api-key": key}, timeout=30)
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                if ("tts" in name and "pro" not in name
+                        and "generateContent" in m.get("supportedGenerationMethods", [])):
+                    names.append(name)
+    except requests.RequestException as e:
+        log("warn: tts model list error %s" % type(e).__name__)
+    names.sort(key=lambda n: (-_version_key(n), n))
+    for fallback in ("gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"):
+        if fallback not in names:
+            names.append(fallback)
+    _tts_state["models"] = names
+    log("info: tts models: %s" % ", ".join(names[:4]))
+    return names
+
+
+def write_wav(path, pcm, rate=24000):
+    import wave
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+
+
+def gemini_tts(text, path):
+    """Gemini TTSで読み上げ音声(wav)を作る。成功でTrue。"""
+    import base64
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        return False
+    voices = [GEMINI_TTS_VOICE] + (["Kore"] if GEMINI_TTS_VOICE != "Kore" else [])
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    for model in tts_models(key):
+        for voice in voices:
+            if (model, voice) in _tts_state["dead"]:
+                continue
+            body = {"contents": [{"parts": [{"text": GEMINI_TTS_STYLE + ": " + text}]}],
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}
+            url = GEMINI_BASE + "/models/" + model + ":generateContent"
+            err = ""
+            for attempt in range(3):
+                try:
+                    r = requests.post(url, headers=headers, json=body, timeout=180)
+                except requests.RequestException as e:
+                    err = type(e).__name__
+                    time.sleep(10)
+                    continue
+                if r.status_code == 200:
+                    try:
+                        part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+                        pcm = base64.b64decode(part["data"])
+                        m = re.search(r"rate=(\d+)", part.get("mimeType", ""))
+                        write_wav(path, pcm, int(m.group(1)) if m else 24000)
+                        if len(pcm) > 4000:
+                            time.sleep(3)
+                            return True
+                        err = "audio too short"
+                    except (KeyError, IndexError, ValueError, TypeError):
+                        err = "no audio in response"
+                    time.sleep(5)
+                    continue
+                err = "%s %s" % (r.status_code, r.text[:160])
+                if r.status_code in (429, 500, 503):
+                    time.sleep(20 * (attempt + 1))
+                    continue
+                break
+            log("warn: gemini tts %s/%s failed (%s)" % (model, voice, err[:140]))
+            if not err.startswith("429"):
+                _tts_state["dead"].add((model, voice))
+    return False
+
+
 async def _edge_tts(text, path):
     import edge_tts
     await edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE).save(path)
 
 
-def make_audio(text, path):
-    """音声を作る。edge-tts -> gTTS の順に試す。全部だめなら False。"""
+def edge_tts_one(text, path):
     for attempt in range(3):
         try:
             asyncio.run(_edge_tts(text, path))
@@ -508,15 +611,41 @@ def make_audio(text, path):
         except Exception as e:
             log("warn: edge-tts failed (%s)" % type(e).__name__)
             time.sleep(3)
+    return False
+
+
+def gtts_one(text, path):
     try:
         from gtts import gTTS
         gTTS(text, lang="ja").save(path)
-        if os.path.exists(path) and os.path.getsize(path) > 1000:
-            log("info: used gTTS")
-            return True
+        return os.path.exists(path) and os.path.getsize(path) > 1000
     except Exception as e:
         log("warn: gTTS failed (%s)" % type(e).__name__)
-    return False
+        return False
+
+
+def make_voices(slides):
+    """全スライドの音声を作る。声がばらつかないよう、同じ方式で全部作れたものだけ採用。
+    Gemini TTS -> edge-tts -> gTTS の順。全部だめなら None（字幕だけの動画）。"""
+    providers = [("gemini", gemini_tts, "wav"), ("edge", edge_tts_one, "mp3"),
+                 ("gtts", gtts_one, "mp3")]
+    only = os.environ.get("VOICE_PROVIDER", "").strip()
+    if only:
+        providers = [p for p in providers if p[0] == only] or providers
+    for name, fn, ext in providers:
+        paths, ok = [], True
+        for i, s in enumerate(slides):
+            path = os.path.join(WORK_DIR, "voice_%02d.%s" % (i, ext))
+            if fn(s["say"], path):
+                paths.append(path)
+            else:
+                ok = False
+                break
+        if ok:
+            log("info: voice = %s" % name)
+            return paths
+        log("warn: voice provider '%s' failed, trying the next one" % name)
+    return [None] * len(slides)
 
 
 def run(cmd):
@@ -558,16 +687,14 @@ def build_video(title, sc, out_path):
     slides.append({"heading": CTA_HEADING, "body": "プロフィールのリンクから",
                    "kicker": "", "say": CTA_NARRATION})
     seed = int(datetime.datetime.now(JST).strftime("%Y%m%d"))
-    segs, silent = [], 0
+    voices = make_voices(slides)
+    silent = sum(1 for v in voices if v is None)
+    segs = []
     for i, s in enumerate(slides):
         png = os.path.join(WORK_DIR, "slide_%02d.png" % i)
         render_slide(s["heading"], s["body"], s["kicker"], i, len(slides), seed, png)
-        mp3 = os.path.join(WORK_DIR, "voice_%02d.mp3" % i)
-        ok = make_audio(s["say"], mp3)
-        if not ok:
-            silent += 1
         seg = os.path.join(WORK_DIR, "seg_%02d.mp4" % i)
-        build_segment(png, mp3 if ok else None, s["say"], seg)
+        build_segment(png, voices[i], s["say"], seg)
         segs.append(seg)
     if silent:
         log("warn: %d/%d slides have no voice (TTS failed)" % (silent, len(slides)))
@@ -620,6 +747,8 @@ def cmd_prepare():
     build_video(art["title"], sc, os.path.join(SITE_DIR, name))
 
     caption = sc["caption"]
+    if CAPTION_FOOTER.strip():
+        caption += "\n\n" + CAPTION_FOOTER.strip()
     if sc["hashtags"]:
         caption += "\n\n" + " ".join("#" + t for t in sc["hashtags"])
     meta = {"file": name, "caption": caption[:2200], "title": art["title"],
