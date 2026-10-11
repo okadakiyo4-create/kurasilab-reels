@@ -48,6 +48,7 @@ jobs:
         id: prep
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_TTS_VOICE: ${{ vars.GEMINI_TTS_VOICE }}
         run: python reels_post.py prepare
 
       - name: Save preview (download to check the video)
