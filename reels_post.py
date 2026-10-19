@@ -69,9 +69,9 @@ BAD_PATTERNS = [
     (r"いかがでしたか", "定型句「いかがでしたか」"),
 ]
 
-CTA_NARRATION = "続きは、プロフィールのリンクから、noteで読めます。"
-CTA_HEADING = "続きはnoteで"
-CAPTION_TAIL = "続きはプロフィールのリンクのnoteで読めます。"
+CTA_NARRATION = "役に立ったら、保存してね。続きは、プロフィールのリンクから、noteで読めます。"
+CTA_HEADING = "保存して、続きはnoteで"
+CAPTION_TAIL = "保存して、あとで試してみてください。続きはプロフィールのリンクのnoteで読めます。"
 # キャプションの末尾に毎回入れるプロフィール紹介（ここを書き換えれば変わります）
 CAPTION_FOOTER = (
     "―――――\n"
